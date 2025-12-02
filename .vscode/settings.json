@@ -4,6 +4,7 @@
         "*.rmd": "markdown",
         "map": "cpp",
         "iostream": "cpp",
-        "sstream": "cpp"
+        "sstream": "cpp",
+        "atomic": "cpp"
     }
 }

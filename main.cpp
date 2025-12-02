@@ -164,6 +164,31 @@ public:
     vector<Instruction> instructions;
     vector<string> outputLog;
 
+    atomic<int> consecutivePageFaults{0};  // track consecutive failures
+
+
+    bool canFitInMemory() const {
+        return memoryRequired <= config.maxOverallMem;
+    }
+
+    // calculate threshold based on system configuration
+    int getMaxConsecutiveFaults() const {
+        // If this process cannot physically fit in memory, fail fast
+        if (!canFitInMemory()) {
+            return 5; 
+        }
+        
+        // If process can fit but memory is fragmented/contested
+        size_t totalFrames = config.maxOverallMem / config.memPerFrame;
+        return max(50, (int)(totalFrames * 2));
+    }
+    
+    bool isDeadlocked() const {
+        return consecutivePageFaults.load() >= getMaxConsecutiveFaults();
+    }
+
+
+
 private:
     void generateInstructions(int count) {
         for (int i = 0; i < count; ++i) {
@@ -782,6 +807,19 @@ private:
     void processGenerator() {
         int cyclesSinceLastGen = 0;
         
+        if (config.minMemPerProc > config.maxOverallMem) {
+            cout << "\n========================================\n";
+            cout << "ERROR: Configuration Invalid!\n";
+            cout << "Processes require " << config.minMemPerProc << " bytes\n";
+            cout << "System only has " << config.maxOverallMem << " bytes\n";
+            cout << "All processes will deadlock immediately.\n";
+            cout << "Process generation disabled.\n";
+            cout << "========================================\n\n";
+            
+            processGeneratorActive = false;
+            return;
+        }
+
         while (processGeneratorActive) {
             this_thread::sleep_for(chrono::seconds(1));
             cyclesSinceLastGen++;
@@ -792,6 +830,13 @@ private:
                     lock_guard<mutex> pLock(processListMutex);
                     
                     string name = "p" + to_string(processCounter);
+
+                    if (config.minMemPerProc > config.maxOverallMem) {
+                        cout << "WARNING: Process " << name 
+                            << " cannot fit in memory (needs " << config.minMemPerProc
+                            << " bytes, system has " << config.maxOverallMem 
+                            << " bytes). Will deadlock immediately.\n";
+                    }
                     
                     Process* newProcess = new Process(processCounter, name, 
                         config.maxCommand, config.minCommand,
@@ -868,6 +913,10 @@ private:
         if (curr == nullptr || instrIndex >= curr->instructions.size()) {
             return true;  // Nothing to check
         }
+
+        if (curr->isDeadlocked()) {
+            return false;
+        }
         
         Instruction& inst = curr->instructions[instrIndex];
         
@@ -924,19 +973,26 @@ private:
         }
         
         // check each needed page and handle page faults
+        bool allPagesLoaded = true;
         for (size_t pageNum : pagesNeeded) {
             if (!curr->isPageInMemory(pageNum)) {
                 // page fault!
                 bool loaded = handlePageFault(curr, pageNum);
                 if (!loaded) {
                     // failed to load page - instruction must retry
-                    return false;
+                    curr->consecutivePageFaults++;
+                    allPagesLoaded = false;
+                    break;
                 }
             }
         }
+
+        if (allPagesLoaded) {
+            curr->consecutivePageFaults = 0; // reset on success
+            return true;
+        }
         
-        // all pages loaded successfully
-        return true;
+        return false;
     }
 
     void fcfs(int coreID) {
@@ -952,10 +1008,9 @@ private:
                 }
             }
             
-            // change this part to make way for demand paging instead of upfront allocation
             if (curr) {
                 
-                while (curr->currentInstruction < curr->totalInstruction && cpusActive && !curr->hasMemoryError) {
+                while (curr->currentInstruction < curr->totalInstruction && cpusActive && !curr->hasMemoryError && !curr->isDeadlocked()) {
 
                     // check if needed pages are loaded
                     bool pagesLoaded = checkAndHandlePageFaults(curr, curr->currentInstruction);
@@ -963,7 +1018,7 @@ private:
                     if (pagesLoaded) {
                         curr->executeInstruction(curr->currentInstruction);
                         curr->currentInstruction++;
-                        activeCpuTicks++; // Count active tick
+                        activeCpuTicks++;
 
                         // check if finished or has error
                         if (curr->currentInstruction >= curr->totalInstruction || curr->hasMemoryError) {
@@ -972,37 +1027,53 @@ private:
                             curr->coreAssigned = -1;
                             
                             memoryManager->deallocateMemory(curr->pID);
-
-                            // clear process's page info
                             curr->pagesInMemory.clear();
                             curr->pageTable.clear();
                         }
 
-                    // delay
-                    if (config.delayTime == 0)
-                        this_thread::sleep_for(chrono::milliseconds(10));
-                    else if (config.delayTime > 0) {
-                        this_thread::sleep_for(chrono::milliseconds(max(1, config.delayTime - 800)));
-                    }
-                    
-                    } else {
-                        // PAGE FAULT occurred - instruction will retry
-                        // Don't increment instruction counter
-                        activeCpuTicks++;  // Still counts as active CPU time
+                        // delay
+                        if (config.delayTime == 0)
+                            this_thread::sleep_for(chrono::milliseconds(10));
+                        else if (config.delayTime > 0) {
+                            this_thread::sleep_for(chrono::milliseconds(max(1, config.delayTime - 800)));
+                        }
                         
-                        // Small delay before retry
+                    } else {
+                        idleCpuTicks++;
                         this_thread::sleep_for(chrono::milliseconds(1));
+                        
+                        if (curr->isDeadlocked()) {
+                            curr->hasMemoryError = true;
+                            curr->memoryErrorAddress = "DEADLOCK: Insufficient memory";
+                            curr->isFinished = true;
+                            curr->endTime = time(nullptr);
+                            curr->coreAssigned = -1;
+                            
+                            memoryManager->deallocateMemory(curr->pID);
+                            curr->pagesInMemory.clear();
+                            curr->pageTable.clear();
+                            break;  
+                        }
                     }
+                }
+                
+                // ✅ HANDLE DEADLOCK OUTSIDE LOOP TOO
+                if (curr->isDeadlocked() && !curr->isFinished) {
+                    curr->hasMemoryError = true;
+                    curr->memoryErrorAddress = "DEADLOCK: Insufficient memory";
+                    curr->isFinished = true;
+                    curr->endTime = time(nullptr);
+                    curr->coreAssigned = -1;
+                    
+                    memoryManager->deallocateMemory(curr->pID);
+                    curr->pagesInMemory.clear();
+                    curr->pageTable.clear();
                 }
                 
             } else {
                 // No process available
                 idleCpuTicks++;
-                if (config.delayTime == 0) {
-                    this_thread::sleep_for(chrono::milliseconds(10));
-                } else if (config.delayTime > 0) {
-                    this_thread::sleep_for(chrono::milliseconds(max(1, config.delayTime - 800)));
-                }
+                this_thread::sleep_for(chrono::milliseconds(100));
             }
         }
     }
@@ -1021,12 +1092,11 @@ private:
             }
 
             if (curr) {
-                
                 int quantum = 0;
 
                 while (quantum < config.timeQuantum 
                     && curr->currentInstruction < curr->totalInstruction 
-                    && cpusActive && !curr->hasMemoryError) {
+                    && cpusActive && !curr->hasMemoryError && !curr->isDeadlocked()) {
                     
                     // check page faults
                     bool pagesLoaded = checkAndHandlePageFaults(curr, curr->currentInstruction);
@@ -1035,7 +1105,7 @@ private:
                         // execute instruction
                         curr->executeInstruction(curr->currentInstruction);
                         curr->currentInstruction++;
-                        quantum++;  // Only increment quantum on successful execution
+                        quantum++;
                         activeCpuTicks++;
                         
                         // check if finished
@@ -1057,14 +1127,39 @@ private:
                         }
                         
                     } else {
-                        // PAGE FAULT - don't count towards quantum
-                        activeCpuTicks++;
+
+                        idleCpuTicks++;
                         this_thread::sleep_for(chrono::milliseconds(1));
+                        
+
+                        if (curr->isDeadlocked()) {
+                            curr->hasMemoryError = true;
+                            curr->memoryErrorAddress = "DEADLOCK: Insufficient memory";
+                            curr->isFinished = true;
+                            curr->endTime = time(nullptr);
+                            curr->coreAssigned = -1;
+                            
+                            memoryManager->deallocateMemory(curr->pID);
+                            curr->pagesInMemory.clear();
+                            curr->pageTable.clear();
+                            break; 
+                        }
                     }
                 }
 
-                // Re-queue if not finished
-                if (!curr->isFinished) {
+                if (curr->isDeadlocked() && !curr->isFinished) {
+                    curr->hasMemoryError = true;
+                    curr->memoryErrorAddress = "DEADLOCK: Insufficient memory";
+                    curr->isFinished = true;
+                    curr->endTime = time(nullptr);
+                    curr->coreAssigned = -1;
+                    
+                    memoryManager->deallocateMemory(curr->pID);
+                    curr->pagesInMemory.clear();
+                    curr->pageTable.clear();
+                }
+                
+                if (!curr->isFinished && !curr->isDeadlocked()) {
                     lock_guard<mutex> lock(queueMutex);
                     curr->coreAssigned = -1;
                     globalQueue.push(curr);
@@ -1072,11 +1167,7 @@ private:
                 
             } else {
                 idleCpuTicks++;
-                if (config.delayTime == 0) {
-                    this_thread::sleep_for(chrono::milliseconds(10));
-                } else if (config.delayTime > 0) {
-                    this_thread::sleep_for(chrono::milliseconds(max(1, config.delayTime - 800)));
-                }
+                this_thread::sleep_for(chrono::milliseconds(100));
             }
         }
     }
@@ -1130,6 +1221,13 @@ public:
         // Use provided memory size or random
         if (memSize == 0) {
             memSize = (rand() % (config.maxMemPerProc - config.minMemPerProc + 1) + config.minMemPerProc);
+        }
+
+        if (memSize > config.maxOverallMem) {
+            cout << "ERROR: Process requires " << memSize 
+                << " bytes but system only has " << config.maxOverallMem 
+                << " bytes total. Cannot create process.\n";
+            return;
         }
         
         int pID = allProcesses.size() + 1;
@@ -1367,12 +1465,12 @@ public:
         
         lock_guard<mutex> lock(processListMutex);
         
-        // Calculate CPU utilization
-        int runningProcesses = 0;
-        for (auto p : allProcesses) {
-            if (!p->isFinished && p->coreAssigned != -1) runningProcesses++;
+        // FIX: Calculate CPU util based on active vs idle ticks (NOT instant core occupancy)
+        unsigned long long totalTicks = idleCpuTicks.load() + activeCpuTicks.load();
+        float cpuUtil = 0.0f;
+        if (totalTicks > 0) {
+            cpuUtil = (activeCpuTicks.load() / (float)totalTicks) * 100.0f;
         }
-        float cpuUtil = (runningProcesses / (float)config.numCPU) * 100.0f;
         
         // Memory information
         size_t totalMem = config.maxOverallMem;
@@ -1403,6 +1501,10 @@ public:
         for (auto p : allProcesses) {
             if (!p->isFinished && !p->hasMemoryError) {
                 hasProcesses = true;
+
+                // show if deadlock
+                string status = p->isDeadlocked() ? " [DEADLOCKED]" : "";
+
                 int pages = 0;
                 if (processMemUsage.find(p->pID) != processMemUsage.end()) {
                     pages = processMemUsage[p->pID];
@@ -1410,7 +1512,7 @@ public:
                 
                 float memMiB = (pages * config.memPerFrame) / 1048576.0f;
                 
-                cout << left << setw(20) << p->name 
+                cout << left << setw(20) << (p->name + status)
                     << fixed << setprecision(0) << memMiB << "MiB\n";
             }
         }
