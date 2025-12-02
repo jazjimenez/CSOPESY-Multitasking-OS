@@ -3,6 +3,7 @@
         "*.embeddedhtml": "html",
         "*.rmd": "markdown",
         "map": "cpp",
-        "iostream": "cpp"
+        "iostream": "cpp",
+        "sstream": "cpp"
     }
 }

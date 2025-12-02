@@ -19,6 +19,7 @@
 #include <sstream>
 #include <cmath>
 #include <atomic>
+#include <set>
 
 void clearConsole() {
 #ifdef _WIN32
@@ -127,6 +128,9 @@ private:
     size_t totalMemory;         // total memory size
     mutex memMutex;         // mutex for thread safety
     mutex backingStoreMutex;    // mutex for backing store file access
+
+    // for demand paging again
+    queue<pair<int, size_t>> fifoQueue; // FIFO queue for page replacement
     
     // logs stuff to csopesy-backing-store.txt
     void logToBackingStore(const string& message) {
@@ -169,50 +173,93 @@ public:
         }
     }
     
-    // allocate memory for a process
-    pair<bool, vector<size_t>> allocateMemory(int processID, size_t memSize) {
+    // changed to demand paging instead of just allocating memory
+    pair<bool, size_t> allocatePage(int processID, size_t pageNum) {
         lock_guard<mutex> lock(memMutex);
         
-        size_t framesNeeded = (memSize + frameSize - 1) / frameSize;
-        vector<size_t> allocatedFrames;
-        
-        for (size_t i = 0; i < frames.size() && allocatedFrames.size() < framesNeeded; i++) {
+        // Find first free frame
+        for (size_t i = 0; i < frames.size(); i++) {
             if (!frames[i].isOccupied) {
-                allocatedFrames.push_back(i);
-            } else {
-                allocatedFrames.clear();
+                frames[i].isOccupied = true;
+                frames[i].processID = processID;
+                
+                // Add to FIFO queue for replacement
+                fifoQueue.push({processID, pageNum});
+                
+                stringstream ss;
+                ss << "PAGE IN: Process " << processID 
+                   << " - Page " << pageNum 
+                   << " loaded into Frame " << i;
+                logToBackingStore(ss.str());
+                
+                return {true, i};  // Return frame index
             }
         }
         
-        if (allocatedFrames.size() == framesNeeded) {
-            for (size_t frameIdx : allocatedFrames) {
-                frames[frameIdx].isOccupied = true;
-                frames[frameIdx].processID = processID;
-            }
-            
-            stringstream ss;
-            ss << "ALLOCATE: Process " << processID << " - " << framesNeeded 
-               << " frames (" << memSize << " bytes) - Frames: [";
-            for (size_t i = 0; i < allocatedFrames.size(); i++) {
-                ss << allocatedFrames[i];
-                if (i < allocatedFrames.size() - 1) ss << ", ";
-            }
-            ss << "]";
-            logToBackingStore(ss.str());
-            
-            return {true, allocatedFrames};
+        return {false, 0};  // No free frames available
+    }
+
+    // check if memory is completely full
+    bool isFull() {
+        lock_guard<mutex> lock(memMutex);
+        for (const auto& frame : frames) {
+            if (!frame.isOccupied) return false;
         }
-        
-        logToBackingStore("ALLOCATE FAILED: Process " + to_string(processID) + 
-                         " - Not enough memory (" + to_string(memSize) + " bytes needed)");
-        return {false, vector<size_t>()};
+        return true;
     }
     
-    // deallocate the memory after process is finished
+    // Dselect victim page for replacement (FIFO)
+    pair<int, size_t> selectVictimPage() {
+        lock_guard<mutex> lock(memMutex);
+        
+        if (fifoQueue.empty()) {
+            return {-1, 0};
+        }
+        
+        auto victim = fifoQueue.front();
+        fifoQueue.pop();
+        return victim;
+    }
+    
+    // evict a specific page from memory
+    bool evictPage(int processID, size_t pageNum, Process* process) {
+        lock_guard<mutex> lock(memMutex);
+        
+        // find the frame containing this page
+        for (auto& frame : frames) {
+            if (frame.processID == processID && frame.isOccupied) {
+                // check if this frame contains the target page
+                // we need to check the process's page table
+                if (process != nullptr && process->pageTable.find(pageNum) != process->pageTable.end()) {
+                    size_t frameIdx = process->pageTable[pageNum];
+                    if (frameIdx == frame.frameIndex) {
+                        // found the correct frame
+                        frame.isOccupied = false;
+                        frame.processID = -1;
+                        
+                        stringstream ss;
+                        ss << "PAGE OUT: Process " << processID 
+                           << " - Page " << pageNum 
+                           << " evicted from Frame " << frame.frameIndex;
+                        logToBackingStore(ss.str());
+                        
+                        // remove from process's page table
+                        process->removePageFromMemory(pageNum);
+                        
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    // deallocate the pages after process is finished
     void deallocateMemory(int processID) {
         lock_guard<mutex> lock(memMutex);
         
-        int deallocatedFrames = 0;
+        int deallocated = 0;
         vector<size_t> freedFrames;
         
         for (auto& frame : frames) {
@@ -220,14 +267,25 @@ public:
                 freedFrames.push_back(frame.frameIndex);
                 frame.isOccupied = false;
                 frame.processID = -1;
-                deallocatedFrames++;
+                deallocated++;
             }
         }
         
-        if (deallocatedFrames > 0) {
+        // Remove from FIFO queue
+        queue<pair<int, size_t>> newQueue;
+        while (!fifoQueue.empty()) {
+            auto item = fifoQueue.front();
+            fifoQueue.pop();
+            if (item.first != processID) {
+                newQueue.push(item);
+            }
+        }
+        fifoQueue = newQueue;
+        
+        if (deallocated > 0) {
             stringstream ss;
-            ss << "DEALLOCATE: Process " << processID << " - " << deallocatedFrames 
-               << " frames freed - Frames: [";
+            ss << "DEALLOCATE ALL: Process " << processID 
+               << " - " << deallocated << " pages freed - Frames: [";
             for (size_t i = 0; i < freedFrames.size(); i++) {
                 ss << freedFrames[i];
                 if (i < freedFrames.size() - 1) ss << ", ";
@@ -309,10 +367,14 @@ public:
     time_t endTime;
     time_t errorTime;
     
-    // memory information
+    // memory information (adjusted for demand paging)
     size_t memoryRequired;
-    vector<size_t> allocatedFrames;
     bool memoryAllocated;
+
+    // damand paging stuff
+    set<size_t> pagesInMemory; // the pages currently in physical memory
+    map<size_t, size_t> pageTable; // page number to frame index
+    atomic<int> pageFaultCount{0}; // number of page faults
 
     // symbol table
     map<string, uint16_t> symbolTable;
@@ -370,6 +432,30 @@ private:
     }
 
 public:
+    // demand paging stuff again
+    size_t getPageNumber(size_t address) {
+        return address / config.memPerFrame;
+    }
+
+    bool isPageInMemory(size_t pageNumber) {
+        return pagesInMemory.find(pageNumber) != pagesInMemory.end();
+    }
+
+    size_t getTotalPages() const {
+        return (memoryRequired + config.memPerFrame - 1) / config.memPerFrame;
+    }
+
+    void addPageToMemory(size_t pageNumber, size_t frameIndex) {
+        pagesInMemory.insert(pageNumber);
+        pageTable[pageNumber] = frameIndex;
+    }
+
+    void removePageFromMemory(size_t pageNumber) {
+        pagesInMemory.erase(pageNumber);
+        pageTable.erase(pageNumber);
+    }
+
+
     Process(int pID, string name, int maxIns, int minIns, size_t minMem, size_t maxMem) {
         this->pID = pID;
         this->name = name;
@@ -722,6 +808,138 @@ private:
         }
     }
 
+    // handle page fault for a process
+    bool handlePageFault(Process* process, size_t pageNum) {
+        if (process == nullptr) return false;
+        
+        process->pageFaultCount++;
+        
+        // try to allocate the page
+        auto [success, frameIdx] = memoryManager->allocatePage(process->pID, pageNum);
+        
+        if (success) {
+            // page loaded successfully
+            process->addPageToMemory(pageNum, frameIdx);
+            numPagedIn++;
+            return true;
+        }
+        
+        // memory is full - need page replacement
+        if (memoryManager->isFull()) {
+            // Select victim using FIFO
+            auto [victimPID, victimPage] = memoryManager->selectVictimPage();
+            
+            if (victimPID == -1) {
+                // no victim found (shouldn't happen)
+                return false;
+            }
+            
+            // find the victim process
+            Process* victimProcess = nullptr;
+            {
+                lock_guard<mutex> lock(processListMutex);
+                for (auto p : allProcesses) {
+                    if (p->pID == victimPID) {
+                        victimProcess = p;
+                        break;
+                    }
+                }
+            }
+            
+            // evict victim page
+            if (victimProcess != nullptr) {
+                memoryManager->evictPage(victimPID, victimPage, victimProcess);
+                numPagedOut++;
+            }
+            
+            // now try to allocate again
+            auto [success2, frameIdx2] = memoryManager->allocatePage(process->pID, pageNum);
+            if (success2) {
+                process->addPageToMemory(pageNum, frameIdx2);
+                numPagedIn++;
+                return true;
+            }
+        }
+        
+        return false;  // failed to load page
+    }
+    
+    // check and handle page faults before executing instruction
+    bool checkAndHandlePageFaults(Process* curr, int instrIndex) {
+        if (curr == nullptr || instrIndex >= curr->instructions.size()) {
+            return true;  // Nothing to check
+        }
+        
+        Instruction& inst = curr->instructions[instrIndex];
+        
+        // determine which pages are needed for this instruction
+        vector<size_t> pagesNeeded;
+        
+        switch (inst.type) {
+            case DECLARE:
+            case ADD:
+            case SUBTRACT:
+            case PRINT: {
+                // need symbol table page (page 0)
+                size_t symbolTablePage = 0;
+                pagesNeeded.push_back(symbolTablePage);
+                break;
+            }
+            
+            case READ: {
+                // need both symbol table AND the memory address page
+                size_t symbolTablePage = 0;
+                pagesNeeded.push_back(symbolTablePage);
+                
+                string addressStr = inst.params[1];
+                try {
+                    size_t address = stoull(addressStr, nullptr, 16);
+                    size_t memoryPage = curr->getPageNumber(address);
+                    pagesNeeded.push_back(memoryPage);
+                } catch (...) {
+                    // invalid address will be caught during execution
+                }
+                break;
+            }
+            
+            case WRITE: {
+                // need symbol table AND destination memory page
+                size_t symbolTablePage = 0;
+                pagesNeeded.push_back(symbolTablePage);
+                
+                string addressStr = inst.params[0];
+                try {
+                    size_t address = stoull(addressStr, nullptr, 16);
+                    size_t memoryPage = curr->getPageNumber(address);
+                    pagesNeeded.push_back(memoryPage);
+                } catch (...) {
+                    // invalid address will be caught during execution
+                }
+                break;
+            }
+            
+            case SLEEP:
+            case FOR_LOOP:
+                // These don't access memory
+                return true;
+        }
+        
+        // check each needed page and handle page faults
+        for (size_t pageNum : pagesNeeded) {
+            if (!curr->isPageInMemory(pageNum)) {
+                // page fault!
+                bool loaded = handlePageFault(curr, pageNum);
+                if (!loaded) {
+                    // failed to load page - instruction must retry
+                    return false;
+                }
+            }
+        }
+        
+        // all pages loaded successfully
+        return true;
+    }
+
     void fcfs(int coreID) {
         while (cpusActive) {
             Process* curr = nullptr;
@@ -734,47 +952,53 @@ private:
                     curr->coreAssigned = coreID;
                 }
             }
-
+            
+            // change this part to make way for demand paging instead of upfront allocation
             if (curr) {
-                if (!curr->memoryAllocated) {
-                    auto [success, frames] = memoryManager->allocateMemory(curr->pID, curr->memoryRequired);
-                    if (success) {
-                        curr->memoryAllocated = true;
-                        curr->allocatedFrames = frames;
-                        numPagedIn += frames.size(); // Track pages loaded
-                    } else {
-                        lock_guard<mutex> lock(queueMutex);
-                        curr->coreAssigned = -1;
-                        globalQueue.push(curr);
-                        idleCpuTicks++; // Idle while waiting for memory
-                        this_thread::sleep_for(chrono::milliseconds(100));
-                        continue;
-                    }
-                }
                 
                 while (curr->currentInstruction < curr->totalInstruction && cpusActive && !curr->hasMemoryError) {
+
+                    // check if needed pages are loaded
+                    bool pagesLoaded = checkAndHandlePageFaults(curr, curr->currentInstruction);
+
+                    if (pagesLoaded) {
+                        curr->executeInstruction(curr->currentInstruction);
+                        curr->currentInstruction++;
+                        activeCpuTicks++; // Count active tick
+
+                        // check if finished or has error
+                        if (curr->currentInstruction >= curr->totalInstruction || curr->hasMemoryError) {
+                            curr->isFinished = true;
+                            curr->endTime = time(nullptr);
+                            curr->coreAssigned = -1;
+                            
+                            memoryManager->deallocateMemory(curr->pID);
+
+                            // clear process's page info
+                            curr->pagesInMemory.clear();
+                            curr->pageTable.clear();
+                        }
+
+                    // delay
                     if (config.delayTime == 0)
                         this_thread::sleep_for(chrono::milliseconds(10));
                     else if (config.delayTime > 0) {
                         this_thread::sleep_for(chrono::milliseconds(max(1, config.delayTime - 800)));
                     }
                     
-                    curr->executeInstruction(curr->currentInstruction);
-                    curr->currentInstruction++;
-                    activeCpuTicks++; // Count active tick
-
-                    if (curr->currentInstruction >= curr->totalInstruction || curr->hasMemoryError) {
-                        curr->isFinished = true;
-                        curr->endTime = time(nullptr);
-                        curr->coreAssigned = -1;
+                    } else {
+                        // PAGE FAULT occurred - instruction will retry
+                        // Don't increment instruction counter
+                        activeCpuTicks++;  // Still counts as active CPU time
                         
-                        size_t pagesFreed = curr->allocatedFrames.size();
-                        memoryManager->deallocateMemory(curr->pID);
-                        numPagedOut += pagesFreed; // Track pages evicted
+                        // Small delay before retry
+                        this_thread::sleep_for(chrono::milliseconds(1));
                     }
                 }
+                
             } else {
-                idleCpuTicks++; // Idle when no process
+                // No process available
+                idleCpuTicks++;
                 if (config.delayTime == 0) {
                     this_thread::sleep_for(chrono::milliseconds(10));
                 } else if (config.delayTime > 0) {
@@ -798,57 +1022,57 @@ private:
             }
 
             if (curr) {
-                if (!curr->memoryAllocated) {
-                    auto [success, frames] = memoryManager->allocateMemory(curr->pID, curr->memoryRequired);
-                    if (success) {
-                        curr->memoryAllocated = true;
-                        curr->allocatedFrames = frames;
-                        numPagedIn += frames.size(); // Track pages loaded
-                    } else {
-                        lock_guard<mutex> lock(queueMutex);
-                        curr->coreAssigned = -1;
-                        globalQueue.push(curr);
-                        idleCpuTicks++; // Idle while waiting
-                        this_thread::sleep_for(chrono::milliseconds(100));
-                        continue;
-                    }
-                }
                 
                 int quantum = 0;
 
                 while (quantum < config.timeQuantum 
-                       && curr->currentInstruction < curr->totalInstruction 
-                       && cpusActive && !curr->hasMemoryError) {
+                    && curr->currentInstruction < curr->totalInstruction 
+                    && cpusActive && !curr->hasMemoryError) {
                     
-                    if (config.delayTime == 0) {
-                        this_thread::sleep_for(chrono::milliseconds(10));
-                    } else if (config.delayTime > 0) {
-                        this_thread::sleep_for(chrono::milliseconds(max(1, config.delayTime - 800)));
-                    }
-
-                    curr->executeInstruction(curr->currentInstruction);
-                    curr->currentInstruction++;
-                    quantum++;
-                    activeCpuTicks++; // Count active tick
-
-                    if (curr->currentInstruction >= curr->totalInstruction || curr->hasMemoryError) {
-                        curr->isFinished = true;
-                        curr->endTime = time(nullptr);
-                        curr->coreAssigned = -1;
+                    // check page faults
+                    bool pagesLoaded = checkAndHandlePageFaults(curr, curr->currentInstruction);
+                    
+                    if (pagesLoaded) {
+                        // execute instruction
+                        curr->executeInstruction(curr->currentInstruction);
+                        curr->currentInstruction++;
+                        quantum++;  // Only increment quantum on successful execution
+                        activeCpuTicks++;
                         
-                        size_t pagesFreed = curr->allocatedFrames.size();
-                        memoryManager->deallocateMemory(curr->pID);
-                        numPagedOut += pagesFreed; // Track pages evicted
+                        // check if finished
+                        if (curr->currentInstruction >= curr->totalInstruction || curr->hasMemoryError) {
+                            curr->isFinished = true;
+                            curr->endTime = time(nullptr);
+                            curr->coreAssigned = -1;
+                            
+                            memoryManager->deallocateMemory(curr->pID);
+                            curr->pagesInMemory.clear();
+                            curr->pageTable.clear();
+                        }
+                        
+                        // Delay
+                        if (config.delayTime == 0) {
+                            this_thread::sleep_for(chrono::milliseconds(10));
+                        } else if (config.delayTime > 0) {
+                            this_thread::sleep_for(chrono::milliseconds(max(1, config.delayTime - 800)));
+                        }
+                        
+                    } else {
+                        // PAGE FAULT - don't count towards quantum
+                        activeCpuTicks++;
+                        this_thread::sleep_for(chrono::milliseconds(1));
                     }
                 }
 
+                // Re-queue if not finished
                 if (!curr->isFinished) {
                     lock_guard<mutex> lock(queueMutex);
                     curr->coreAssigned = -1;
                     globalQueue.push(curr);
                 }
+                
             } else {
-                idleCpuTicks++; // Idle when no process
+                idleCpuTicks++;
                 if (config.delayTime == 0) {
                     this_thread::sleep_for(chrono::milliseconds(10));
                 } else if (config.delayTime > 0) {
@@ -1085,6 +1309,12 @@ public:
         unsigned long long pagedIn = numPagedIn.load();
         unsigned long long pagedOut = numPagedOut.load();
         
+        // show total page faults
+        int totalPageFaults = 0;
+        for (auto p : allProcesses) {
+            totalPageFaults += p->pageFaultCount.load();
+        }
+        
         int activeProcesses = 0;
         int inactiveProcesses = 0;
         
@@ -1100,34 +1330,31 @@ public:
         cout << "           VMSTAT - MEMORY STATISTICS          \n";
         cout << "===========================================\n";
         
-        // Memory Information
         cout << "Total Memory:     " << setw(10) << totalMem << " bytes\n";
         cout << "Used Memory:      " << setw(10) << usedMem << " bytes\n";
         cout << "Free Memory:      " << setw(10) << freeMem << " bytes\n";
         
         cout << "\n-------------------------------------------\n";
         
-        // Page Information
         cout << "Total Pages:      " << setw(10) << memoryManager->getTotalFrames() << "\n";
         cout << "Used Pages:       " << setw(10) << memoryManager->getNumPagesUsed() << "\n";
         cout << "Free Pages:       " << setw(10) << memoryManager->getNumPagesFree() << "\n";
         
         cout << "\n-------------------------------------------\n";
         
-        // CPU Tick Information
         cout << "Idle CPU Ticks:   " << setw(10) << idleTicks << "\n";
         cout << "Active CPU Ticks: " << setw(10) << activeTicks << "\n";
         cout << "Total CPU Ticks:  " << setw(10) << totalCpuTicks << "\n";
         
         cout << "\n-------------------------------------------\n";
         
-        // Paging Information
+        // show page fault statistics
+        cout << "Total Page Faults:" << setw(10) << totalPageFaults << "\n";
         cout << "Num Paged In:     " << setw(10) << pagedIn << "\n";
         cout << "Num Paged Out:    " << setw(10) << pagedOut << "\n";
         
         cout << "\n-------------------------------------------\n";
         
-        // Process Information
         cout << "Active Processes:   " << setw(8) << activeProcesses << "\n";
         cout << "Inactive Processes: " << setw(8) << inactiveProcesses << "\n";
         cout << "===========================================\n";
@@ -1247,7 +1474,6 @@ public:
             getline(cin, processCommand);
 
             if (processCommand == "process-smi") {
-                // ORIGINAL IMPLEMENTATION - Simple process view
                 cout << "\n----------------------------------------------\n";
                 cout << "Process name: " << targetProcess->name << "\n";
                 cout << "ID: " << targetProcess->pID << "\n";
@@ -1258,8 +1484,11 @@ public:
                 strftime(dateBuffer, sizeof(dateBuffer), "%m/%d/%Y %I:%M:%S%p", &timeinfo);
                 cout << "Created: " << dateBuffer << "\n";
                 
+                // show memory and page information
                 cout << "\nMemory Usage: " << targetProcess->memoryRequired << " bytes\n";
-                cout << "Pages Allocated: " << targetProcess->allocatedFrames.size() << "\n";
+                cout << "Total Pages Needed: " << targetProcess->getTotalPages() << "\n";
+                cout << "Pages in Memory: " << targetProcess->pagesInMemory.size() << "\n";
+                cout << "Page Faults: " << targetProcess->pageFaultCount.load() << "\n";
                 
                 if (!targetProcess->outputLog.empty()) {
                     cout << "\nLogs:\n";
@@ -1444,6 +1673,50 @@ void initializeSystem(Screen& screen) {
     screen.startCPUs();
 }
 
+// auto-calculate memory requirement based on instructions
+size_t calculateRequiredMemory(const vector<Instruction>& instructions) {
+    size_t maxAddress = Process::SYMBOL_TABLE_SIZE;  // Start with symbol table (64 bytes)
+    
+    // scan all READ/WRITE instructions to find highest memory address
+    for (const auto& inst : instructions) {
+        if (inst.type == READ) {
+            // READ <var> <address>
+            string addressStr = inst.params[1];
+            try {
+                size_t address = stoull(addressStr, nullptr, 16);
+                if (address > maxAddress) {
+                    maxAddress = address;
+                }
+            } catch (...) {
+                // Invalid address - will be caught during execution
+            }
+        }
+        else if (inst.type == WRITE) {
+            // WRITE <address> <value>
+            string addressStr = inst.params[0];
+            try {
+                size_t address = stoull(addressStr, nullptr, 16);
+                if (address > maxAddress) {
+                    maxAddress = address;
+                }
+            } catch (...) {
+                // invalid address - will be caught during execution
+            }
+        }
+    }
+    
+    // add some padding for the value being written (2 bytes for uint16)
+    maxAddress += 2;
+    
+    // round up to nearest valid memory size (power of 2)
+    size_t memSize = 64;  // Minimum
+    while (memSize < maxAddress && memSize < 65536) {
+        memSize *= 2;
+    }
+    
+    return memSize;
+}
+
 int main() {
     srand(time(0));
     string command = "";
@@ -1494,16 +1767,23 @@ int main() {
             if (is_initialized) {
                 size_t firstQuote = command.find('"');
                 if (firstQuote == string::npos) {
-                    cout << "Invalid format. Use: screen -c <name> <memory> \"<instructions>\"\n";
+                    cout << "Invalid format. Use: screen -c <name> [<memory>] \"<instructions>\"\n";
                     continue;
                 }
                 
                 string beforeQuote = command.substr(10, firstQuote - 10);
                 stringstream ss(beforeQuote);
                 string name;
-                size_t memSize;
+                size_t memSize = 0;  // Default to 0 (auto-calculate)
                 
-                ss >> name >> memSize;
+                ss >> name;
+                if (ss >> memSize) {
+                    // Memory size was provided - validate it
+                    if (!isValidMemorySize(memSize)) {
+                        cout << "Invalid memory allocation. Must be power of 2 in range [64, 65536].\n";
+                        continue;
+                    }
+                }
                 
                 size_t lastQuote = command.rfind('"');
                 if (lastQuote == firstQuote) {
@@ -1513,9 +1793,23 @@ int main() {
                 
                 string instructions = command.substr(firstQuote + 1, lastQuote - firstQuote - 1);
                 
-                if (name.empty() || memSize == 0) {
-                    cout << "Invalid format. Use: screen -c <name> <memory> \"<instructions>\"\n";
+                if (name.empty()) {
+                    cout << "Invalid format. Use: screen -c <name> [<memory>] \"<instructions>\"\n";
                 } else {
+                    // Parse instructions first to calculate required memory
+                    vector<Instruction> parsedInstructions = parseInstructions(instructions);
+                    
+                    if (parsedInstructions.empty() || parsedInstructions.size() > 50) {
+                        cout << "Invalid command. Instruction count must be between 1 and 50.\n";
+                        continue;
+                    }
+                    
+                    // auto-calculate memory if not provided
+                    if (memSize == 0) {
+                        memSize = calculateRequiredMemory(parsedInstructions);
+                        cout << "Auto-calculated memory requirement: " << memSize << " bytes\n";
+                    }
+                    
                     screen.createProcessWithInstructions(name, memSize, instructions);
                 }
             }
