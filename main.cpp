@@ -120,229 +120,6 @@ struct MemoryFrame {
     MemoryFrame(size_t idx) : frameIndex(idx), isOccupied(false), processID(-1) {}
 };
 
-class MemoryManager {
-private:
-    vector<MemoryFrame> frames; // frame table
-    size_t totalFrames;         // total number of frames
-    size_t frameSize;           // size of each frame
-    size_t totalMemory;         // total memory size
-    mutex memMutex;         // mutex for thread safety
-    mutex backingStoreMutex;    // mutex for backing store file access
-
-    // for demand paging again
-    queue<pair<int, size_t>> fifoQueue; // FIFO queue for page replacement
-    
-    // logs stuff to csopesy-backing-store.txt
-    void logToBackingStore(const string& message) {
-        lock_guard<mutex> lock(backingStoreMutex);
-        ofstream backingStore("csopesy-backing-store.txt", ios::out | ios::app);
-        if (backingStore.is_open()) {
-            time_t now = time(nullptr);
-            struct tm timeinfo;
-            localtime_s(&timeinfo, &now);
-            char timestamp[32];
-            strftime(timestamp, sizeof(timestamp), "[%Y-%m-%d %H:%M:%S]", &timeinfo);
-            
-            backingStore << timestamp << " " << message << "\n";
-            backingStore.close();
-        }
-    }
-    
-public:
-    // initialize memory manager
-    MemoryManager(size_t maxMem, size_t memPerFrame) 
-        : totalMemory(maxMem), frameSize(memPerFrame) {
-        totalFrames = maxMem / memPerFrame;
-
-        // create all the frames
-        for (size_t i = 0; i < totalFrames; i++) {
-            frames.push_back(MemoryFrame(i));
-        }
-        
-        // Initialize backing store file
-        ofstream backingStore("csopesy-backing-store.txt", ios::out | ios::trunc);
-        if (backingStore.is_open()) {
-            backingStore << "========================================\n";
-            backingStore << "CSOPESY BACKING STORE\n";
-            backingStore << "========================================\n";
-            backingStore << "Total Memory: " << totalMemory << " bytes\n";
-            backingStore << "Frame Size: " << frameSize << " bytes\n";
-            backingStore << "Total Frames: " << totalFrames << "\n";
-            backingStore << "========================================\n\n";
-            backingStore.close();
-        }
-    }
-    
-    // changed to demand paging instead of just allocating memory
-    pair<bool, size_t> allocatePage(int processID, size_t pageNum) {
-        lock_guard<mutex> lock(memMutex);
-        
-        // Find first free frame
-        for (size_t i = 0; i < frames.size(); i++) {
-            if (!frames[i].isOccupied) {
-                frames[i].isOccupied = true;
-                frames[i].processID = processID;
-                
-                // Add to FIFO queue for replacement
-                fifoQueue.push({processID, pageNum});
-                
-                stringstream ss;
-                ss << "PAGE IN: Process " << processID 
-                   << " - Page " << pageNum 
-                   << " loaded into Frame " << i;
-                logToBackingStore(ss.str());
-                
-                return {true, i};  // Return frame index
-            }
-        }
-        
-        return {false, 0};  // No free frames available
-    }
-
-    // check if memory is completely full
-    bool isFull() {
-        lock_guard<mutex> lock(memMutex);
-        for (const auto& frame : frames) {
-            if (!frame.isOccupied) return false;
-        }
-        return true;
-    }
-    
-    // Dselect victim page for replacement (FIFO)
-    pair<int, size_t> selectVictimPage() {
-        lock_guard<mutex> lock(memMutex);
-        
-        if (fifoQueue.empty()) {
-            return {-1, 0};
-        }
-        
-        auto victim = fifoQueue.front();
-        fifoQueue.pop();
-        return victim;
-    }
-    
-    // evict a specific page from memory
-    bool evictPage(int processID, size_t pageNum, Process* process) {
-        lock_guard<mutex> lock(memMutex);
-        
-        // find the frame containing this page
-        for (auto& frame : frames) {
-            if (frame.processID == processID && frame.isOccupied) {
-                // check if this frame contains the target page
-                // we need to check the process's page table
-                if (process != nullptr && process->pageTable.find(pageNum) != process->pageTable.end()) {
-                    size_t frameIdx = process->pageTable[pageNum];
-                    if (frameIdx == frame.frameIndex) {
-                        // found the correct frame
-                        frame.isOccupied = false;
-                        frame.processID = -1;
-                        
-                        stringstream ss;
-                        ss << "PAGE OUT: Process " << processID 
-                           << " - Page " << pageNum 
-                           << " evicted from Frame " << frame.frameIndex;
-                        logToBackingStore(ss.str());
-                        
-                        // remove from process's page table
-                        process->removePageFromMemory(pageNum);
-                        
-                        return true;
-                    }
-                }
-            }
-        }
-        
-        return false;
-    }
-    
-    // deallocate the pages after process is finished
-    void deallocateMemory(int processID) {
-        lock_guard<mutex> lock(memMutex);
-        
-        int deallocated = 0;
-        vector<size_t> freedFrames;
-        
-        for (auto& frame : frames) {
-            if (frame.processID == processID) {
-                freedFrames.push_back(frame.frameIndex);
-                frame.isOccupied = false;
-                frame.processID = -1;
-                deallocated++;
-            }
-        }
-        
-        // Remove from FIFO queue
-        queue<pair<int, size_t>> newQueue;
-        while (!fifoQueue.empty()) {
-            auto item = fifoQueue.front();
-            fifoQueue.pop();
-            if (item.first != processID) {
-                newQueue.push(item);
-            }
-        }
-        fifoQueue = newQueue;
-        
-        if (deallocated > 0) {
-            stringstream ss;
-            ss << "DEALLOCATE ALL: Process " << processID 
-               << " - " << deallocated << " pages freed - Frames: [";
-            for (size_t i = 0; i < freedFrames.size(); i++) {
-                ss << freedFrames[i];
-                if (i < freedFrames.size() - 1) ss << ", ";
-            }
-            ss << "]";
-            logToBackingStore(ss.str());
-        }
-    }
-    
-    // get total used memory for vmstat
-    size_t getUsedMemory() {
-        lock_guard<mutex> lock(memMutex);
-        size_t used = 0;
-        for (const auto& frame : frames) {
-            if (frame.isOccupied) used++;
-        }
-        return used * frameSize;
-    }
-    
-    // get total free memory for vmstat
-    size_t getFreeMemory() {
-        return totalMemory - getUsedMemory();
-    }
-    
-    // getters
-    size_t getTotalFrames() { return totalFrames; }
-    size_t getFrameSize() { return frameSize; }
-    
-    // additional stats
-    int getNumPagesUsed() {
-        lock_guard<mutex> lock(memMutex);
-        int count = 0;
-        for (const auto& frame : frames) {
-            if (frame.isOccupied) count++;
-        }
-        return count;
-    }
-    
-    // get number of free pages
-    int getNumPagesFree() {
-        return totalFrames - getNumPagesUsed();
-    }
-
-    // get memory usage per process
-    map<int, int> getProcessMemoryUsage() {
-        lock_guard<mutex> lock(memMutex);
-        map<int, int> processFrames;
-        
-        for (const auto& frame : frames) {
-            if (frame.isOccupied) {
-                processFrames[frame.processID]++;
-            }
-        }
-        
-        return processFrames;
-    }
-};
 
 // check if memory size is power of 2 and within range
 bool isValidMemorySize(size_t memSize) {
@@ -700,6 +477,228 @@ public:
     }
 };
 
+class MemoryManager {
+private:
+    vector<MemoryFrame> frames; // frame table
+    size_t totalFrames;         // total number of frames
+    size_t frameSize;           // size of each frame
+    size_t totalMemory;         // total memory size
+    mutex memMutex;         // mutex for thread safety
+    mutex backingStoreMutex;    // mutex for backing store file access
+
+    // for demand paging again
+    queue<pair<int, size_t>> fifoQueue; // FIFO queue for page replacement
+    // logs stuff to csopesy-backing-store.txt
+    void logToBackingStore(const string& message) {
+        lock_guard<mutex> lock(backingStoreMutex);
+        ofstream backingStore("csopesy-backing-store.txt", ios::out | ios::app);
+        if (backingStore.is_open()) {
+            time_t now = time(nullptr);
+            struct tm timeinfo;
+            localtime_s(&timeinfo, &now);
+            char timestamp[32];
+            strftime(timestamp, sizeof(timestamp), "[%Y-%m-%d %H:%M:%S]", &timeinfo);
+            
+            backingStore << timestamp << " " << message << "\n";
+            backingStore.close();
+        }
+    }
+    
+public:
+    // initialize memory manager
+    MemoryManager(size_t maxMem, size_t memPerFrame) 
+        : totalMemory(maxMem), frameSize(memPerFrame) {
+        totalFrames = maxMem / memPerFrame;
+
+        // create all the frames
+        for (size_t i = 0; i < totalFrames; i++) {
+            frames.push_back(MemoryFrame(i));
+        }
+        
+        // Initialize backing store file
+        ofstream backingStore("csopesy-backing-store.txt", ios::out | ios::trunc);
+        if (backingStore.is_open()) {
+            backingStore << "========================================\n";
+            backingStore << "CSOPESY BACKING STORE\n";
+            backingStore << "========================================\n";
+            backingStore << "Total Memory: " << totalMemory << " bytes\n";
+            backingStore << "Frame Size: " << frameSize << " bytes\n";
+            backingStore << "Total Frames: " << totalFrames << "\n";
+            backingStore << "========================================\n\n";
+            backingStore.close();
+        }
+    }
+    
+    // changed to demand paging instead of just allocating memory
+    pair<bool, size_t> allocatePage(int processID, size_t pageNum) {
+        lock_guard<mutex> lock(memMutex);
+        
+        // Find first free frame
+        for (size_t i = 0; i < frames.size(); i++) {
+            if (!frames[i].isOccupied) {
+                frames[i].isOccupied = true;
+                frames[i].processID = processID;
+                
+                // Add to FIFO queue for replacement
+                fifoQueue.push({processID, pageNum});
+                
+                stringstream ss;
+                ss << "PAGE IN: Process " << processID 
+                   << " - Page " << pageNum 
+                   << " loaded into Frame " << i;
+                logToBackingStore(ss.str());
+                
+                return {true, i};  // Return frame index
+            }
+        }
+        
+        return {false, 0};  // No free frames available
+    }
+
+    // check if memory is completely full
+    bool isFull() {
+        lock_guard<mutex> lock(memMutex);
+        for (const auto& frame : frames) {
+            if (!frame.isOccupied) return false;
+        }
+        return true;
+    }
+    
+    // Dselect victim page for replacement (FIFO)
+    pair<int, size_t> selectVictimPage() {
+        lock_guard<mutex> lock(memMutex);
+        
+        if (fifoQueue.empty()) {
+            return {-1, 0};
+        }
+        
+        auto victim = fifoQueue.front();
+        fifoQueue.pop();
+        return victim;
+    }
+    
+    // evict a specific page from memory
+    bool evictPage(int processID, size_t pageNum, Process* process) {
+        lock_guard<mutex> lock(memMutex);
+        
+        // find the frame containing this page
+        for (auto& frame : frames) {
+            if (frame.processID == processID && frame.isOccupied) {
+                // check if this frame contains the target page
+                // we need to check the process's page table
+                if (process != nullptr && process->pageTable.find(pageNum) != process->pageTable.end()) {
+                    size_t frameIdx = process->pageTable[pageNum];
+                    if (frameIdx == frame.frameIndex) {
+                        // found the correct frame
+                        frame.isOccupied = false;
+                        frame.processID = -1;
+                        
+                        stringstream ss;
+                        ss << "PAGE OUT: Process " << processID 
+                           << " - Page " << pageNum 
+                           << " evicted from Frame " << frame.frameIndex;
+                        logToBackingStore(ss.str());
+                        
+                        // remove from process's page table
+                        process->removePageFromMemory(pageNum);
+                        
+                        return true;
+                    }
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    // deallocate the pages after process is finished
+    void deallocateMemory(int processID) {
+        lock_guard<mutex> lock(memMutex);
+        
+        int deallocated = 0;
+        vector<size_t> freedFrames;
+        
+        for (auto& frame : frames) {
+            if (frame.processID == processID) {
+                freedFrames.push_back(frame.frameIndex);
+                frame.isOccupied = false;
+                frame.processID = -1;
+                deallocated++;
+            }
+        }
+        
+        // Remove from FIFO queue
+        queue<pair<int, size_t>> newQueue;
+        while (!fifoQueue.empty()) {
+            auto item = fifoQueue.front();
+            fifoQueue.pop();
+            if (item.first != processID) {
+                newQueue.push(item);
+            }
+        }
+        fifoQueue = newQueue;
+        
+        if (deallocated > 0) {
+            stringstream ss;
+            ss << "DEALLOCATE ALL: Process " << processID 
+               << " - " << deallocated << " pages freed - Frames: [";
+            for (size_t i = 0; i < freedFrames.size(); i++) {
+                ss << freedFrames[i];
+                if (i < freedFrames.size() - 1) ss << ", ";
+            }
+            ss << "]";
+            logToBackingStore(ss.str());
+        }
+    }
+    
+    // get total used memory for vmstat
+    size_t getUsedMemory() {
+        lock_guard<mutex> lock(memMutex);
+        size_t used = 0;
+        for (const auto& frame : frames) {
+            if (frame.isOccupied) used++;
+        }
+        return used * frameSize;
+    }
+    
+    // get total free memory for vmstat
+    size_t getFreeMemory() {
+        return totalMemory - getUsedMemory();
+    }
+    
+    // getters
+    size_t getTotalFrames() { return totalFrames; }
+    size_t getFrameSize() { return frameSize; }
+    
+    // additional stats
+    int getNumPagesUsed() {
+        lock_guard<mutex> lock(memMutex);
+        int count = 0;
+        for (const auto& frame : frames) {
+            if (frame.isOccupied) count++;
+        }
+        return count;
+    }
+    
+    // get number of free pages
+    int getNumPagesFree() {
+        return totalFrames - getNumPagesUsed();
+    }
+
+    // get memory usage per process
+    map<int, int> getProcessMemoryUsage() {
+        lock_guard<mutex> lock(memMutex);
+        map<int, int> processFrames;
+        
+        for (const auto& frame : frames) {
+            if (frame.isOccupied) {
+                processFrames[frame.processID]++;
+            }
+        }
+        
+        return processFrames;
+    }
+};
 void printNotInitialized() {
     cout << "Please initialize the system first!" << endl;
 }
