@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "*.embeddedhtml": "html",
+        "*.rmd": "markdown",
+        "map": "cpp",
+        "iostream": "cpp",
+        "sstream": "cpp",
+        "atomic": "cpp"
+    }
+}
